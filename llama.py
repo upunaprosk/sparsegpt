@@ -22,7 +22,7 @@ def get_llama(model):
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
     from transformers import LlamaForCausalLM
-    model = LlamaForCausalLM.from_pretrained(model, torch_dtype='auto')
+    model = LlamaForCausalLM.from_pretrained(model, torch_dtype="auto")
     model.seqlen = 2048
     return model
 
@@ -40,8 +40,21 @@ def llama_sequential(model, dataloader, dev):
     layers[0] = layers[0].to(dev)
 
     dtype = next(iter(model.parameters())).dtype
+
+    # --------- BATCH-AWARE COLLECTION OF INPUTS ----------
+    # dataloader: iterable of (input_ids, targets), input_ids can have batch>1
+    batch_sizes = []
+    nsamples_total = 0
+    for batch in dataloader:
+        inp = batch[0]          # [batch_size, seqlen]
+        bsz = inp.shape[0]
+        batch_sizes.append(bsz)
+        nsamples_total += bsz
+
     inps = torch.zeros(
-        (args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
+        (nsamples_total, model.seqlen, model.config.hidden_size),
+        dtype=dtype,
+        device=dev,
     )
     cache = {"i": 0, "attention_mask": None}
 
@@ -51,18 +64,28 @@ def llama_sequential(model, dataloader, dev):
             self.module = module
 
         def forward(self, inp, **kwargs):
-            inps[cache["i"]] = inp
-            cache["i"] += 1
-            cache["attention_mask"] = kwargs["attention_mask"]
+            # inp: [B, seqlen, hidden_size]
+            bsz = inp.shape[0]
+            start = cache["i"]
+            end = start + bsz
+            inps[start:end] = inp
+            cache["i"] = end
+            cache["attention_mask"] = kwargs.get("attention_mask", None)
             raise ValueError
 
+    # Re-run dataloader to actually fill `inps` through the first layer
+    # (we need a fresh iterator)
     layers[0] = Catcher(layers[0])
+    idx_batch = 0
     for batch in dataloader:
+        # dataloader may be a list, so we just iterate again in same order
         try:
             model(batch[0].to(dev))
         except ValueError:
             pass
+        idx_batch += 1
     layers[0] = layers[0].module
+    # -----------------------------------------------------
 
     layers[0] = layers[0].cpu()
     model.model.embed_tokens = model.model.embed_tokens.cpu()
@@ -105,17 +128,26 @@ def llama_sequential(model, dataloader, dev):
                         args.wbits, perchannel=True, sym=False, mse=False
                     )
 
+            # --------- BATCH SUPPORT INTO SparseGPT ----------
             def add_batch(name):
                 def tmp(_, inp, out):
+                    # inp is a tuple; inp[0] is the tensor with batch dimension.
                     gpts[name].add_batch(inp[0].data, out.data)
-
                 return tmp
+            # ------------------------------------------------
 
             handles = []
             for name in subset:
                 handles.append(subset[name].register_forward_hook(add_batch(name)))
-            for j in range(args.nsamples):
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+
+            # Replay this layer on the saved inputs using the same batch sizes
+            idx = 0
+            for bsz in batch_sizes:
+                inp_batch = inps[idx : idx + bsz]  # [B, seqlen, hidden]
+                out_batch = layer(inp_batch, attention_mask=attention_mask)[0]
+                outs[idx : idx + bsz] = out_batch
+                idx += bsz
+
             for h in handles:
                 h.remove()
 
@@ -132,8 +164,13 @@ def llama_sequential(model, dataloader, dev):
                 )
                 gpts[name].free()
 
-        for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+        # After pruning, propagate outputs to be inputs for next layer
+        idx = 0
+        for bsz in batch_sizes:
+            inp_batch = inps[idx : idx + bsz]
+            out_batch = layer(inp_batch, attention_mask=attention_mask)[0]
+            outs[idx : idx + bsz] = out_batch
+            idx += bsz
 
         layers[i] = layer.cpu()
         del layer
@@ -148,7 +185,7 @@ def llama_sequential(model, dataloader, dev):
 
 
 @torch.no_grad()
-def llama_eval(model, testenc, dev,  dataset: str, log_wandb: bool = False):
+def llama_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
     print("Evaluating ...")
 
     testenc = testenc.input_ids
@@ -163,11 +200,13 @@ def llama_eval(model, testenc, dev,  dataset: str, log_wandb: bool = False):
 
     dtype = next(iter(model.parameters())).dtype
     inps = torch.zeros(
-        (nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
+        (nsamples, model.seqlen, model.config.hidden_size),
+        dtype=dtype,
+        device=dev,
     )
     cache = {"i": 0, "attention_mask": None}
 
-    class Catcher(nn.Module):
+    class CatcherEval(nn.Module):
         def __init__(self, module):
             super().__init__()
             self.module = module
@@ -175,10 +214,10 @@ def llama_eval(model, testenc, dev,  dataset: str, log_wandb: bool = False):
         def forward(self, inp, **kwargs):
             inps[cache["i"]] = inp
             cache["i"] += 1
-            cache["attention_mask"] = kwargs["attention_mask"]
+            cache["attention_mask"] = kwargs.get("attention_mask", None)
             raise ValueError
 
-    layers[0] = Catcher(layers[0])
+    layers[0] = CatcherEval(layers[0])
     for i in range(nsamples):
         batch = testenc[:, (i * model.seqlen) : ((i + 1) * model.seqlen)].to(dev)
         try:
@@ -226,7 +265,9 @@ def llama_eval(model, testenc, dev,  dataset: str, log_wandb: bool = False):
             hidden_states = model.model.norm(hidden_states)
         lm_logits = model.lm_head(hidden_states)
         shift_logits = lm_logits[:, :-1, :].contiguous()
-        shift_labels = testenc[:, (i * model.seqlen) : ((i + 1) * model.seqlen)][:, 1:]
+        shift_labels = testenc[:, (i * model.seqlen) : ((i + 1) * model.seqlen)][
+            :, 1:
+        ]
         loss_fct = nn.CrossEntropyLoss()
         loss = loss_fct(
             shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
@@ -251,14 +292,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "dataset",
         type=str,
-        choices=["wikitext2", "ptb", "c4"],
+        choices=["wikitext2", "ptb", "c4", "stereoset"],
         help="Where to extract calibration data from.",
     )
     parser.add_argument(
         "--seed", type=int, default=0, help="Seed for sampling the calibration data."
     )
     parser.add_argument(
-        "--nsamples", type=int, default=128, help="Number of calibration data samples."
+        "--nsamples", type=int, default=128, help="Number of calibration data *pairs* or samples."
     )
     parser.add_argument(
         "--percdamp",
@@ -311,11 +352,18 @@ if __name__ == "__main__":
         assert has_wandb, "wandb not installed try `pip install wandb`"
         wandb.init(config=args)
 
+    DEV = "cuda" if torch.cuda.is_available() else "cpu"
+
     model = get_llama(args.model)
     model.eval()
 
+    # dataloader should yield (input_ids, targets), with batch size possibly 2 for stereoset
     dataloader, testloader = get_loaders(
-        args.dataset, nsamples=args.nsamples, seed=args.seed, model=args.model, seqlen=model.seqlen
+        args.dataset,
+        nsamples=args.nsamples,
+        seed=args.seed,
+        model=args.model,
+        seqlen=model.seqlen,
     )
 
     if (args.sparsity or args.prunen) and not args.gmp:
@@ -323,10 +371,11 @@ if __name__ == "__main__":
         llama_sequential(model, dataloader, DEV)
         for n, p in model.named_parameters():
             print(n, torch.mean((p == 0).float()))
-            if 'down_proj' in n:
+            if "down_proj" in n:
                 break
         print(time.time() - tick)
 
+    # Perplexity eval still on standard language modeling datasets
     for dataset in ["wikitext2", "ptb", "c4"]:
         dataloader, testloader = get_loaders(
             dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
