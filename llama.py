@@ -1,3 +1,4 @@
+import os
 import time
 
 import torch
@@ -27,30 +28,20 @@ def get_llama(model):
     return model
 
 
-@torch.no_grad()
+@torch.no_grad__()
 def llama_sequential(model, dataloader, dev):
     print("Starting...")
-
     use_cache = model.config.use_cache
     model.config.use_cache = False
     layers = model.model.layers
-
     model.model.embed_tokens = model.model.embed_tokens.to(dev)
-    model.model.norm = model.model.norm.to(dev)
+    if getattr(model.model, "norm", None) is not None:
+        model.model.norm = model.model.norm.to(dev)
     layers[0] = layers[0].to(dev)
-
     dtype = next(iter(model.parameters())).dtype
-
-    # --------- BATCH-AWARE COLLECTION OF INPUTS ----------
-    # dataloader: iterable of (input_ids, targets), input_ids can have batch>1
-    batch_sizes = []
     nsamples_total = 0
     for batch in dataloader:
-        inp = batch[0]          # [batch_size, seqlen]
-        bsz = inp.shape[0]
-        batch_sizes.append(bsz)
-        nsamples_total += bsz
-
+        nsamples_total += batch[0].shape[0]
     inps = torch.zeros(
         (nsamples_total, model.seqlen, model.config.hidden_size),
         dtype=dtype,
@@ -64,7 +55,6 @@ def llama_sequential(model, dataloader, dev):
             self.module = module
 
         def forward(self, inp, **kwargs):
-            # inp: [B, seqlen, hidden_size]
             bsz = inp.shape[0]
             start = cache["i"]
             end = start + bsz
@@ -73,131 +63,94 @@ def llama_sequential(model, dataloader, dev):
             cache["attention_mask"] = kwargs.get("attention_mask", None)
             raise ValueError
 
-    # Re-run dataloader to actually fill `inps` through the first layer
-    # (we need a fresh iterator)
     layers[0] = Catcher(layers[0])
-    idx_batch = 0
     for batch in dataloader:
-        # dataloader may be a list, so we just iterate again in same order
         try:
             model(batch[0].to(dev))
         except ValueError:
             pass
-        idx_batch += 1
     layers[0] = layers[0].module
-    # -----------------------------------------------------
-
     layers[0] = layers[0].cpu()
     model.model.embed_tokens = model.model.embed_tokens.cpu()
-    model.model.norm = model.model.norm.cpu()
+    if getattr(model.model, "norm", None) is not None:
+        model.model.norm = model.model.norm.cpu()
     torch.cuda.empty_cache()
-
     outs = torch.zeros_like(inps)
     attention_mask = cache["attention_mask"]
-
     print("Ready.")
+    alpha = float(os.environ.get("ALPHA", "0"))
+    pair_mode = (alpha != 0.0)
+    if pair_mode and (nsamples_total % 2 != 0):
+        print("WARNING: ALPHA != 0 but nsamples_total is odd; last sample will be ignored for pairing.")
+    step = 2 if pair_mode else 1
 
-    quantizers = {}
     for i in range(len(layers)):
         layer = layers[i].to(dev)
-        full = find_layers(layer)
-
-        if args.true_sequential:
-            sequential = [
-                ["self_attn.k_proj", "self_attn.v_proj", "self_attn.q_proj"],
-                ["self_attn.o_proj"],
-                ["mlp.up_proj", "mlp.gate_proj"],
-                ["mlp.down_proj"],
-            ]
-        else:
-            sequential = [list(full.keys())]
-
-        for names in sequential:
-            subset = {n: full[n] for n in names}
-
-            gpts = {}
-            for name in subset:
-                if (
-                    not (args.minlayer <= i < args.maxlayer and args.prune_only in name)
-                ) == (not args.invert):
-                    continue
-                gpts[name] = SparseGPT(subset[name])
-                if args.wbits < 16:
-                    gpts[name].quantizer = Quantizer()
-                    gpts[name].quantizer.configure(
-                        args.wbits, perchannel=True, sym=False, mse=False
-                    )
-
-            # --------- BATCH SUPPORT INTO SparseGPT ----------
-            def add_batch(name):
-                def tmp(_, inp, out):
-                    # inp is a tuple; inp[0] is the tensor with batch dimension.
-                    gpts[name].add_batch(inp[0].data, out.data)
-                return tmp
-            # ------------------------------------------------
-
-            handles = []
-            for name in subset:
-                handles.append(subset[name].register_forward_hook(add_batch(name)))
-
-            # Replay this layer on the saved inputs using the same batch sizes
-            idx = 0
-            for bsz in batch_sizes:
-                inp_batch = inps[idx : idx + bsz]  # [B, seqlen, hidden]
-                out_batch = layer(inp_batch, attention_mask=attention_mask)[0]
-                outs[idx : idx + bsz] = out_batch
-                idx += bsz
-
-            for h in handles:
-                h.remove()
-
-            for name in subset:
-                print(i, name)
-                print("Pruning ...")
-                sparsity = args.sparsity
-                gpts[name].fasterprune(
-                    sparsity,
-                    prunen=args.prunen,
-                    prunem=args.prunem,
-                    percdamp=args.percdamp,
-                    blocksize=args.blocksize,
+        subset = find_layers(layer)
+        gpts = {}
+        for name in subset:
+            if (not (args.minlayer <= i < args.maxlayer and args.prune_only in name)) == (not args.invert):
+                continue
+            gpts[name] = SparseGPT(subset[name])
+            if args.wbits < 16:
+                gpts[name].quantizer = Quantizer()
+                gpts[name].quantizer.configure(
+                    args.wbits, perchannel=True, sym=False, mse=False
                 )
-                gpts[name].free()
 
-        # After pruning, propagate outputs to be inputs for next layer
-        idx = 0
-        for bsz in batch_sizes:
-            inp_batch = inps[idx : idx + bsz]
-            out_batch = layer(inp_batch, attention_mask=attention_mask)[0]
-            outs[idx : idx + bsz] = out_batch
-            idx += bsz
+        def add_batch(name):
+            def tmp(_, inp, out):
+                gpts[name].add_batch(inp[0], out)
+            return tmp
+
+        handles = []
+        for name in gpts:
+            handles.append(subset[name].register_forward_hook(add_batch(name)))
+
+        for j in range(0, nsamples_total, step):
+            x = inps[j:j+step]
+            out = layer(x, attention_mask=attention_mask)[0]
+            outs[j:j+step] = out
+
+        for h in handles:
+            h.remove()
+
+        for name in gpts:
+            print(i, name)
+            print("Pruning...")
+            sparsity = args.sparsity
+            gpts[name].fasterprune(
+                sparsity,
+                prunen=args.prunen,
+                prunem=args.prunem,
+                percdamp=args.percdamp,
+                blocksize=args.blocksize,
+            )
+            gpts[name].free()
+
+        for j in range(0, nsamples_total, step):
+            x = inps[j:j+step]
+            out = layer(x, attention_mask=attention_mask)[0]
+            outs[j:j+step] = out
 
         layers[i] = layer.cpu()
         del layer
-        del gpts
         torch.cuda.empty_cache()
-
         inps, outs = outs, inps
 
     model.config.use_cache = use_cache
 
-    return quantizers
 
-
-@torch.no_grad()
+@torch.no_grad__()
 def llama_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
     print("Evaluating ...")
-
     testenc = testenc.input_ids
     nsamples = testenc.numel() // model.seqlen
-
     use_cache = model.config.use_cache
     model.config.use_cache = False
     layers = model.model.layers
-
     model.model.embed_tokens = model.model.embed_tokens.to(dev)
     layers[0] = layers[0].to(dev)
-
     dtype = next(iter(model.parameters())).dtype
     inps = torch.zeros(
         (nsamples, model.seqlen, model.config.hidden_size),
@@ -219,33 +172,27 @@ def llama_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
 
     layers[0] = CatcherEval(layers[0])
     for i in range(nsamples):
-        batch = testenc[:, (i * model.seqlen) : ((i + 1) * model.seqlen)].to(dev)
+        batch = testenc[:, (i * model.seqlen):((i + 1) * model.seqlen)].to(dev)
         try:
             model(batch)
         except ValueError:
             pass
     layers[0] = layers[0].module
-
     layers[0] = layers[0].cpu()
     model.model.embed_tokens = model.model.embed_tokens.cpu()
     torch.cuda.empty_cache()
-
     outs = torch.zeros_like(inps)
     attention_mask = cache["attention_mask"]
 
     for i in range(len(layers)):
         print(i)
         layer = layers[i].to(dev)
-
         if args.gmp:
             subset = find_layers(layer)
             for name in subset:
                 W = subset[name].weight.data
-                thresh = torch.sort(torch.abs(W.flatten()))[0][
-                    int(W.numel() * args.sparsity)
-                ]
+                thresh = torch.sort(torch.abs(W.flatten()))[0][int(W.numel() * args.sparsity)]
                 W.data[torch.abs(W.data) <= thresh] = 0
-
         for j in range(nsamples):
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
         layers[i] = layer.cpu()
@@ -253,111 +200,67 @@ def llama_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
         torch.cuda.empty_cache()
         inps, outs = outs, inps
 
-    if model.model.norm is not None:
+    if getattr(model.model, "norm", None) is not None:
         model.model.norm = model.model.norm.to(dev)
     model.lm_head = model.lm_head.to(dev)
-
     testenc = testenc.to(dev)
     nlls = []
     for i in range(nsamples):
         hidden_states = inps[i].unsqueeze(0)
-        if model.model.norm is not None:
+        if getattr(model.model, "norm", None) is not None:
             hidden_states = model.model.norm(hidden_states)
         lm_logits = model.lm_head(hidden_states)
         shift_logits = lm_logits[:, :-1, :].contiguous()
-        shift_labels = testenc[:, (i * model.seqlen) : ((i + 1) * model.seqlen)][
-            :, 1:
-        ]
+        shift_labels = testenc[:, (i * model.seqlen):((i + 1) * model.seqlen)][:, 1:]
         loss_fct = nn.CrossEntropyLoss()
         loss = loss_fct(
-            shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1)
         )
         neg_log_likelihood = loss.float() * model.seqlen
         nlls.append(neg_log_likelihood)
+
     ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
     print(f"Perplexity: {ppl.item():3f}")
     if log_wandb:
         wandb.log({f"{dataset}/perplexity": ppl.item()})
-
     model.config.use_cache = use_cache
 
 
 if __name__ == "__main__":
     import argparse
     from datautils import *
-
     parser = argparse.ArgumentParser()
-
-    parser.add_argument("model", type=str, help="LlaMA model to load")
+    parser.add_argument("model", type=str, help="LLaMA model to load")
     parser.add_argument(
         "dataset",
         type=str,
         choices=["wikitext2", "ptb", "c4", "stereoset"],
-        help="Where to extract calibration data from.",
+        help="Calibration dataset",
     )
-    parser.add_argument(
-        "--seed", type=int, default=0, help="Seed for sampling the calibration data."
-    )
-    parser.add_argument(
-        "--nsamples", type=int, default=128, help="Number of calibration data *pairs* or samples."
-    )
-    parser.add_argument(
-        "--percdamp",
-        type=float,
-        default=0.01,
-        help="Percent of the average Hessian diagonal to use for dampening.",
-    )
-    parser.add_argument("--sparsity", type=float, default=0, help="Target sparsity")
-    parser.add_argument("--prunen", type=int, default=0, help="N for N:M pruning.")
-    parser.add_argument("--prunem", type=int, default=0, help="M for N:M pruning.")
-    parser.add_argument(
-        "--blocksize",
-        type=int,
-        default=128,
-        help="Blocksize to use for adaptive mask selection.",
-    )
-    parser.add_argument(
-        "--gmp", action="store_true", help="Whether to run the GMP baseline."
-    )
-    parser.add_argument(
-        "--wbits", type=int, default=16, help="Whether to quantize as well."
-    )
-    parser.add_argument(
-        "--minlayer", type=int, default=-1, help="Prune all layers with id >= this."
-    )
-    parser.add_argument(
-        "--maxlayer", type=int, default=1000, help="Prune all layers with id < this."
-    )
-    parser.add_argument(
-        "--prune_only",
-        type=str,
-        default="",
-        help="Prune only layers that contain this text.",
-    )
-    parser.add_argument("--invert", action="store_true", help="Invert subset.")
-    parser.add_argument("--save", type=str, default="", help="Path to saved model.")
-    parser.add_argument(
-        "--true-sequential",
-        action="store_true",
-        help="Whether to run in true sequential model.",
-    )
-    parser.add_argument(
-        "--log_wandb", action="store_true", help="Whether to log to wandb."
-    )
-
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--nsamples", type=int, default=128)
+    parser.add_argument("--percdamp", type=float, default=0.01)
+    parser.add_argument("--sparsity", type=float, default=0)
+    parser.add_argument("--prunen", type=int, default=0)
+    parser.add_argument("--prunem", type=int, default=0)
+    parser.add_argument("--blocksize", type=int, default=128)
+    parser.add_argument("--gmp", action="store_true")
+    parser.add_argument("--wbits", type=int, default=16)
+    parser.add_argument("--minlayer", type=int, default=-1)
+    parser.add_argument("--maxlayer", type=int, default=1000)
+    parser.add_argument("--prune_only", type=str, default="")
+    parser.add_argument("--invert", action="store_true")
+    parser.add_argument("--save", type=str, default="")
+    parser.add_argument("--true-sequential", action="store_true")
+    parser.add_argument("--log_wandb", action="store_true")
     args = parser.parse_args()
-
-    # init W&B logging
     if args.log_wandb:
-        assert has_wandb, "wandb not installed try `pip install wandb`"
+        assert has_wandb, "wandb not installed"
         wandb.init(config=args)
-
     DEV = "cuda" if torch.cuda.is_available() else "cpu"
-
     model = get_llama(args.model)
     model.eval()
-
-    # dataloader should yield (input_ids, targets), with batch size possibly 2 for stereoset
     dataloader, testloader = get_loaders(
         args.dataset,
         nsamples=args.nsamples,
@@ -365,7 +268,6 @@ if __name__ == "__main__":
         model=args.model,
         seqlen=model.seqlen,
     )
-
     if (args.sparsity or args.prunen) and not args.gmp:
         tick = time.time()
         llama_sequential(model, dataloader, DEV)
@@ -374,14 +276,11 @@ if __name__ == "__main__":
             if "down_proj" in n:
                 break
         print(time.time() - tick)
-
-    # Perplexity eval still on standard language modeling datasets
     for dataset in ["wikitext2", "ptb", "c4"]:
         dataloader, testloader = get_loaders(
             dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
         )
         print("Dataset:", dataset)
         llama_eval(model, testloader, DEV, dataset, args.log_wandb)
-
     if args.save:
         model.save_pretrained(args.save)
