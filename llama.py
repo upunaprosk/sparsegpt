@@ -28,7 +28,7 @@ def get_llama(model):
     return model
 
 
-@torch.no_grad__()
+@torch.no_grad()
 def llama_sequential(model, dataloader, dev):
     print("Starting...")
     use_cache = model.config.use_cache
@@ -141,7 +141,7 @@ def llama_sequential(model, dataloader, dev):
     model.config.use_cache = use_cache
 
 
-@torch.no_grad__()
+@torch.no_grad()
 def llama_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
     print("Evaluating ...")
     testenc = testenc.input_ids
@@ -235,7 +235,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "dataset",
         type=str,
-        choices=["wikitext2", "ptb", "c4", "stereoset"],
+        choices=["wikitext2", "ptb", "c4", "stereoset", "bbq"],
         help="Calibration dataset",
     )
     parser.add_argument("--seed", type=int, default=0)
@@ -276,7 +276,7 @@ if __name__ == "__main__":
             if "down_proj" in n:
                 break
         print(time.time() - tick)
-    for dataset in ["wikitext2", "ptb", "c4"]:
+    for dataset in ["wikitext2"]:
         dataloader, testloader = get_loaders(
             dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
         )
