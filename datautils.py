@@ -58,7 +58,7 @@ def get_bbq(nsamples, seed, seqlen, model, tokenizer):
 
         answers = [a0, a1, a2]
 
-        # Keep the 2 answers that are NOT the “undetermined” one
+        # Keep the 2 answers that are NOT the N/A cannot be determined one
         keep = [answers[i] for i in range(3) if i != lab]
         if len(keep) != 2:
             continue
