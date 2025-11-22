@@ -263,49 +263,74 @@ def get_c4(nsamples, seed, seqlen, model, tokenizer):
 
 
 def get_stereoset(nsamples, seed, seqlen, model, tokenizer):
-    url = "https://raw.githubusercontent.com/gsgoncalves/EMNLP2023_llm_compression_and_social_bias/refs/heads/main/data/stereoset/dev.json"
+
+    url = (
+        "https://raw.githubusercontent.com/"
+        "gsgoncalves/EMNLP2023_llm_compression_and_social_bias/"
+        "refs/heads/main/data/stereoset/dev.json"
+    )
     with urllib.request.urlopen(url) as f:
         data = json.load(f)
 
+    random.seed(seed)
     pairs = []
     for entry in data["data"]["intrasentence"]:
-        a = None
-        b = None
-        for s in entry["sentences"]:
-            if s["gold_label"] == "anti-stereotype":
-                a = s["sentence"]
-            elif s["gold_label"] == "stereotype":
-                b = s["sentence"]
-        if a is not None and b is not None:
-            pairs.append((a, b))
+        stereo = None
+        anti   = None
 
-    if nsamples < len(pairs):
-        pairs = pairs[:nsamples]
+        for s in entry["sentences"]:
+            if s["gold_label"] == "stereotype":
+                stereo = s["sentence"]
+            elif s["gold_label"] == "anti-stereotype":
+                anti = s["sentence"]
+
+        if stereo and anti:
+            pairs.append((stereo, anti))
+
+    pairs = pairs[:nsamples]
 
     trainloader = []
-    for a, b in pairs:
+
+    for stereo, anti in pairs:
+
+        raw0 = tokenizer(
+            stereo, truncation=True, max_length=seqlen, return_tensors="pt"
+        )
+        raw1 = tokenizer(
+            anti, truncation=True, max_length=seqlen, return_tensors="pt"
+        )
+
+        if raw0.input_ids.shape[1] != raw1.input_ids.shape[1]:
+            # Skip uneven pairs (breaks pair Hessian math)
+            continue
+
         t = tokenizer(
-            [a, b],
+            [stereo, anti],
             return_tensors="pt",
             padding="max_length",
             truncation=True,
             max_length=seqlen,
         )
-        inp = t.input_ids
+
+        inp = t.input_ids           # shape [2, seqlen]
         tar = inp.clone()
-        tar[:, :-1] = -100
+        tar[:, :-1] = -100          # causal LM ignore mask
+
         trainloader.append((inp, tar))
 
     flat = []
-    for a, b in pairs:
-        flat.append(a)
-        flat.append(b)
+    for stereo, anti in pairs:
+        flat.append(stereo)
+        flat.append(anti)
+
     testenc = tokenizer(" ".join(flat), return_tensors="pt")
 
-    class T:
+    class Wrap:
         def __init__(self, ids):
             self.input_ids = ids
-    return trainloader, T(testenc.input_ids)
+
+    return trainloader, Wrap(testenc["input_ids"])
+
 
 
 def get_loaders(name, nsamples=128, seed=0, seqlen=2048, model=''):
