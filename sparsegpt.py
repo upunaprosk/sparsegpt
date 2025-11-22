@@ -68,7 +68,7 @@ class SparseGPT:
             if samples_Hx01 <= 0:
                 samples_Hx01 = 1.0
 
-            delta = math.sqrt(2.0 / samples_Hx01) * (X0 - X1)  # [H, T]
+            delta = math.sqrt(2.0) * (X0 - X1)  # [H, T]
             # this is a proper [H, H] matrix, same shape as H
             H_x01 = delta.matmul(delta.t())  # [H, H]
 
