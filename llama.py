@@ -47,7 +47,7 @@ def llama_sequential(model, dataloader, dev):
         dtype=dtype,
         device=dev,
     )
-    cache = {"i": 0}
+    cache = {"i": 0, "attention_mask": None}
 
     class Catcher(nn.Module):
         def __init__(self, module):
@@ -60,6 +60,7 @@ def llama_sequential(model, dataloader, dev):
             end = start + bsz
             inps[start:end] = inp
             cache["i"] = end
+            cache["attention_mask"] = kwargs.get("attention_mask", None)
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -75,12 +76,14 @@ def llama_sequential(model, dataloader, dev):
         model.model.norm = model.model.norm.cpu()
     torch.cuda.empty_cache()
     outs = torch.zeros_like(inps)
+    attention_mask = cache["attention_mask"]
     print("Ready.")
     alpha = float(os.environ.get("ALPHA", "0"))
-    pair_mode = alpha != 0.0
+    pair_mode = (alpha != 0.0)
     if pair_mode and (nsamples_total % 2 != 0):
         print("WARNING: ALPHA != 0 but nsamples_total is odd; last sample will be ignored for pairing.")
     step = 2 if pair_mode else 1
+    base_position_ids = torch.arange(0, model.seqlen, device=dev).unsqueeze(0)
 
     for i in range(len(layers)):
         layer = layers[i].to(dev)
@@ -106,24 +109,22 @@ def llama_sequential(model, dataloader, dev):
             handles.append(subset[name].register_forward_hook(add_batch(name)))
 
         for j in range(0, nsamples_total, step):
-            x = inps[j:j + step]
-            bsz, seqlen, _ = x.shape
-            position_ids = torch.arange(seqlen, device=x.device).unsqueeze(0).expand(bsz, -1)
-            attention_mask = model.model._prepare_decoder_attention_mask(
-                None,
-                (bsz, seqlen),
-                x,
-                0,
-            )
-            position_embeddings = model.model.rotary_emb(x, position_ids)
-            out = layer(
-                x,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                cache_position=None,
-                position_embeddings=position_embeddings,
-            )[0]
-            outs[j:j + step] = out
+            x = inps[j:j+step]
+            if x.size(0) == 0:
+                continue
+            position_ids = base_position_ids.expand(x.size(0), -1)
+            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "rotary_emb"):
+                cos, sin = layer.self_attn.rotary_emb(x, position_ids)
+                position_embeddings = (cos, sin)
+                out = layer(
+                    x,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    position_embeddings=position_embeddings,
+                )[0]
+            else:
+                out = layer(x, attention_mask=attention_mask)[0]
+            outs[j:j+step] = out
 
         for h in handles:
             h.remove()
@@ -142,24 +143,22 @@ def llama_sequential(model, dataloader, dev):
             gpts[name].free()
 
         for j in range(0, nsamples_total, step):
-            x = inps[j:j + step]
-            bsz, seqlen, _ = x.shape
-            position_ids = torch.arange(seqlen, device=x.device).unsqueeze(0).expand(bsz, -1)
-            attention_mask = model.model._prepare_decoder_attention_mask(
-                None,
-                (bsz, seqlen),
-                x,
-                0,
-            )
-            position_embeddings = model.model.rotary_emb(x, position_ids)
-            out = layer(
-                x,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                cache_position=None,
-                position_embeddings=position_embeddings,
-            )[0]
-            outs[j:j + step] = out
+            x = inps[j:j+step]
+            if x.size(0) == 0:
+                continue
+            position_ids = base_position_ids.expand(x.size(0), -1)
+            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "rotary_emb"):
+                cos, sin = layer.self_attn.rotary_emb(x, position_ids)
+                position_embeddings = (cos, sin)
+                out = layer(
+                    x,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    position_embeddings=position_embeddings,
+                )[0]
+            else:
+                out = layer(x, attention_mask=attention_mask)[0]
+            outs[j:j+step] = out
 
         layers[i] = layer.cpu()
         del layer
@@ -185,7 +184,7 @@ def llama_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
         dtype=dtype,
         device=dev,
     )
-    cache = {"i": 0}
+    cache = {"i": 0, "attention_mask": None}
 
     class CatcherEval(nn.Module):
         def __init__(self, module):
@@ -195,6 +194,7 @@ def llama_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
         def forward(self, inp, **kwargs):
             inps[cache["i"]] = inp
             cache["i"] += 1
+            cache["attention_mask"] = kwargs.get("attention_mask", None)
             raise ValueError
 
     layers[0] = CatcherEval(layers[0])
@@ -209,6 +209,8 @@ def llama_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
     model.model.embed_tokens = model.model.embed_tokens.cpu()
     torch.cuda.empty_cache()
     outs = torch.zeros_like(inps)
+    attention_mask = cache["attention_mask"]
+    base_position_ids = torch.arange(0, model.seqlen, device=dev).unsqueeze(0)
 
     for i in range(len(layers)):
         print(i)
@@ -221,23 +223,18 @@ def llama_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
                 W.data[torch.abs(W.data) <= thresh] = 0
         for j in range(nsamples):
             x = inps[j].unsqueeze(0)
-            bsz, seqlen, _ = x.shape
-            position_ids = torch.arange(seqlen, device=x.device).unsqueeze(0).expand(bsz, -1)
-            attention_mask = model.model._prepare_decoder_attention_mask(
-                None,
-                (bsz, seqlen),
-                x,
-                0,
-            )
-            position_embeddings = model.model.rotary_emb(x, position_ids)
-            out = layer(
-                x,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                cache_position=None,
-                position_embeddings=position_embeddings,
-            )[0]
-            outs[j] = out
+            position_ids = base_position_ids.expand(x.size(0), -1)
+            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "rotary_emb"):
+                cos, sin = layer.self_attn.rotary_emb(x, position_ids)
+                position_embeddings = (cos, sin)
+                outs[j] = layer(
+                    x,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    position_embeddings=position_embeddings,
+                )[0]
+            else:
+                outs[j] = layer(x, attention_mask=attention_mask)[0]
         layers[i] = layer.cpu()
         del layer
         torch.cuda.empty_cache()
@@ -262,7 +259,6 @@ def llama_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
         )
         neg_log_likelihood = loss.float() * model.seqlen
         nlls.append(neg_log_likelihood)
-
     ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
     print(f"Perplexity: {ppl.item():3f}")
     if log_wandb:

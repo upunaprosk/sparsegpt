@@ -8,6 +8,8 @@ from datasets import load_dataset
 from transformers import AutoTokenizer, LlamaTokenizer
 
 
+
+
 def set_seed(seed):
     np.random.seed(seed)
     torch.random.manual_seed(seed)
@@ -26,6 +28,85 @@ def get_tokenizer(model):
     else:
         tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False)
     return tokenizer
+
+
+
+
+def extract_stereo_key(ex):
+    sg = ex["additional_metadata"]["stereotyped_groups"]
+    ai = ex["answer_info"]
+    for k in ["ans0", "ans1", "ans2"]:
+        for g in ai[k]:
+            if g in sg:
+                return k
+    return None
+
+
+def get_bbq_stereo(nsamples, seed, seqlen, tokenizer):
+    ds = load_dataset("oskarvanderwal/bbq", "All")
+
+    recs = []
+    for s in ["train", "validation", "test"]:
+        if s in ds:
+            recs.extend(ds[s])
+
+    ambig = [ex for ex in recs if ex["context_condition"] == "ambig"]
+
+    random.seed(seed)
+    out = []
+
+    for ex in ambig:
+        ctx = ex["context"]
+        q   = ex["question"]
+
+        biased_key = extract_stereo_key(ex)
+        if biased_key is None:
+            continue
+        ans_biased = ex[biased_key]
+
+        lab = ex["label"]
+        ans_label = ex[f"ans{lab}"]
+
+        full_biased = f"{ctx}\nQ: {q}\nA: {ans_biased}"
+        full_label  = f"{ctx}\nQ: {q}\nA: {ans_label}"
+
+        raw0 = tokenizer(full_biased, truncation=True, max_length=seqlen, return_tensors="pt")
+        raw1 = tokenizer(full_label,  truncation=True, max_length=seqlen, return_tensors="pt")
+        if raw0.input_ids.shape[1] != raw1.input_ids.shape[1]:
+            continue
+
+        t = tokenizer(
+            [full_biased, full_label],
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=seqlen
+        )
+
+        inp = t.input_ids
+        tar = inp.clone()
+        tar[:, :-1] = -100
+
+        label = 1  # first is biased, second is label
+
+        out.append((inp, tar, label))
+
+        if len(out) >= nsamples:
+            break
+
+    texts = []
+    for inp, _, _ in out:
+        texts.append(tokenizer.decode(inp[0], skip_special_tokens=True))
+        texts.append(tokenizer.decode(inp[1], skip_special_tokens=True))
+
+    test = tokenizer(" ".join(texts), return_tensors="pt")
+
+    class Wrap:
+        def __init__(self, x):
+            self.input_ids = x
+
+    return out, Wrap(test["input_ids"])
+
 
 
 def get_bbq(nsamples, seed, seqlen, model, tokenizer):
@@ -229,6 +310,8 @@ def get_stereoset(nsamples, seed, seqlen, model, tokenizer):
 
 def get_loaders(name, nsamples=128, seed=0, seqlen=2048, model=''):
     tokenizer = get_tokenizer(model)
+    if "bb_stereo" in name:
+        return get_bbq_stereo(nsamples, seed, seqlen, tokenizer)
     if "bbq" in name:
         return get_bbq(nsamples, seed, seqlen, model, tokenizer)
     if 'wikitext2' in name:
